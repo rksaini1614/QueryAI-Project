@@ -63,6 +63,24 @@ def generate_sql_from_text(user_query: str) -> str:
     return response.choices[0].message.content.strip()
 
 
+# Create the Safety Layer
+def is_safe_query(sql_query:str) -> bool:
+    """Checks if the SQL query is safe to execute (read-only)."""
+
+    sql_upper = sql_query.upper()
+
+    forbidden_keywords = [
+        "DELETE", "UPDATE", "INSERT", "DROP", "ALTER", 
+        "TRUNCATE", "CREATE", "GRANT", "REVOKE"
+    ] 
+
+    for keyword in forbidden_keywords:
+        if f"{keyword}" in f"{sql_upper}":
+            return False
+
+    return True
+
+
 # Health check endpoint (GET)
 @app.get("/")
 def health_check():
@@ -82,6 +100,13 @@ async def execute_query(request: QueryRequest, db: Session = Depends(get_db)):
         # Send english query to the LLM and get SQL back
         generated_sql = generate_sql_from_text(request.user_query)
         print(f"Generated SQL: {generated_sql}")
+
+        # safety check 
+        if not is_safe_query(generated_sql):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Security Alert: The generated query attempts to modify the database. Only SELECT queries are allowed. Query blocked: {generated_sql}"
+            )
 
         result = db.execute(text(generated_sql))
         data = [dict(row._mapping) for row in result]
