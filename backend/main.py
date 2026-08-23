@@ -11,6 +11,8 @@ import models
 from auth import get_password_hash, verify_password, create_access_token, get_current_user
 from datetime import timedelta
 from inspector import extract_schema
+from fastapi.middleware.cors import CORSMiddleware
+import json
 
 
 # Automatically create tables in the database if they don't exist
@@ -22,6 +24,18 @@ app = FastAPI(
     title="QueryAI API",
     description="Backend for Natural Language to SQL Analytics",
     version="1.0"
+)
+
+# add middlewares
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -51,43 +65,40 @@ class QueryRequest(BaseModel):
     user_query: str
 
 
-# Propmt Engineering : The schema
-# DB_SCHEMA = """
-# Database: ecommerce
-# Tables:
-# 1. customers (customer_id, name, city)
-# 2. products (product_id, product_name, category, price)
-# 3. orders (order_id, customer_id, order_date, ampount)
-# """
-
-def generate_sql_from_text(user_query: str, schema_text:str) -> str:
-    """Calls the LLM to translate English into SQL."""
+def generate_sql_from_text(user_query: str, schema_text: str) -> tuple[str, str]:
+    """Calls the LLM to translate English into SQL and provide an explanation."""
 
     system_prompt = f"""
-    You are an expert PostgreSQL developer. 
-    Convert the user's natural language question into a valid PostgreSQL query.
+    You are an expert PostgreSQL developer and data analyst. 
+    Convert the user's natural language question into a valid PostgreSQL query and provide a concise explanation.
     
     Here is the database schema:
     {schema_text}
     
     Rules:
-    1. ONLY return the SQL query, nothing else. No explanations.
-    2. Do not wrap the SQL in markdown formatting (like ```sql ... ```). Just the raw SQL string.
-    3. Use JOINs if necessary.
+    1. Respond ONLY with a valid JSON object containing two exact keys: "sql" and "explanation".
+    2. "sql": The raw executable PostgreSQL string (only SELECT queries), without markdown formatting or code blocks.
+    3. "explanation": A concise 1-2 sentence explanation of the query logic.
     """
 
     response = client.chat.completions.create(
         model="openai/gpt-3.5-turbo",
         messages=[
-            {"role" : "system", "content":system_prompt},
-            {"role":"user","content":user_query}
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_query}
         ],
         temperature=0
     )
 
-    return response.choices[0].message.content.strip()
+    content = response.choices[0].message.content.strip()
+    
+    try:
+        parsed_data = json.loads(content)
+        return parsed_data["sql"].strip(), parsed_data["explanation"].strip()
+    except Exception:
+        return content, "Explanation could not be generated."
 
-
+    
 # Create the Safety Layer
 def is_safe_query(sql_query:str) -> bool:
     """Checks if the SQL query is safe to execute (read-only)."""
@@ -213,14 +224,36 @@ def connect_database(conn_data: DBConnectionCreate, db: Session=Depends(get_db),
             detail=f"Could not connect or inspect the database. Error: {str(e)}"
         )
 
+@app.get("/connections")
+def get_user_connections(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    try:
+        connections = db.query(models.DBConnection).filter(
+            models.DBConnection.user_id == current_user.id
+        ).all()
+        
+        saved_dbs = []
+        for conn in connections:
+            saved_dbs.append({
+                "id": conn.id,
+                "name": conn.connection_name,
+                "schema": conn.schema_cache
+            })
+            
+        return {
+                "status": "success", 
+                "connections": saved_dbs
+            }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch connections: {str(e)}"
+        )
+
 
 # Query endpoint (POST)
 @app.post("/query")
 async def execute_query(request: QueryRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     try:
-        #print(f"User asked : {request.user_query}")
-        #test_sql = "SELECT * FROM customers LIMIT 2;"
-
         # Verify the connection belongs to this user
         connection = db.query(models.DBConnection).filter(
             models.DBConnection.id == request.connection_id,
@@ -233,34 +266,76 @@ async def execute_query(request: QueryRequest, db: Session = Depends(get_db), cu
                 detail="Database connection not found."
             )
 
-        # Send english query to the LLM and get SQL back
-        generated_sql = generate_sql_from_text(request.user_query, connection.schema_cache)
-        print(f"Generated SQL: {generated_sql}")
+        # Initial English query translation to SQL
+        generated_sql, explanation = generate_sql_from_text(request.user_query, connection.schema_cache)
+        
+        max_retries = 2
+        retry_count = 0
+        execution_success = False
+        data = None
+        last_error = None
 
-        # safety check 
-        if not is_safe_query(generated_sql):
-            failed_history = models.QueryHistory(
+        target_engine = create_engine(connection.db_url)
+
+        while retry_count <= max_retries and not execution_success:
+            # Safety check
+            if not is_safe_query(generated_sql):
+                failed_history = models.QueryHistory(
+                    user_id=current_user.id, 
+                    connection_id=connection.id,
+                    user_prompt=request.user_query, 
+                    generated_sql=generated_sql, 
+                    status="BLOCKED"
+                )
+                db.add(failed_history)
+                db.commit()
+
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Security Alert: The generated query attempts to modify the database. Only SELECT queries are allowed. Query blocked: {generated_sql}"
+                )
+
+            try:
+                # Execute on target database
+                with target_engine.connect() as target_conn:
+                    result = target_conn.execute(text(generated_sql))
+                    data = [dict(row._mapping) for row in result]
+                execution_success = True
+            except SQLAlchemyError as db_err:
+                last_error = str(db_err)
+                retry_count += 1
+                if retry_count <= max_retries:
+                    # Self-Correction Prompt handling
+                    correction_prompt = f"""
+                    The previous SQL query failed during execution.
+                    Original User Request: {request.user_query}
+                    Failed SQL: {generated_sql}
+                    Database Error: {last_error}
+                    
+                    Fix the SQL query based on the error message and schema.
+                    Respond ONLY with a valid JSON object containing exact keys: "sql" and "explanation".
+                    """
+                    generated_sql, explanation = generate_sql_from_text(correction_prompt, connection.schema_cache)
+                else:
+                    break
+
+        if not execution_success:
+            error_history = models.QueryHistory(
                 user_id=current_user.id, 
-                connection_id=connection.id,
+                connection_id=request.connection_id,
                 user_prompt=request.user_query, 
                 generated_sql=generated_sql, 
-                status="BLOCKED"
+                status="ERROR"
             )
-            db.add(failed_history)
+            db.add(error_history)
             db.commit()
 
             raise HTTPException(
-                status_code=403,
-                detail=f"Security Alert: The generated query attempts to modify the database. Only SELECT queries are allowed. Query blocked: {generated_sql}"
+                status_code=500,
+                detail=f"Target database execution failed after retries. Last error: {last_error}"
             )
 
-        # Execute on the target database
-        target_engine = create_engine(connection.db_url)
-        with target_engine.connect() as target_conn:
-            result = target_conn.execute(text(generated_sql))
-            data = [dict(row._mapping) for row in result]
-
-        # Log the succesful query to history
+        # Log the successful query to history
         success_history = models.QueryHistory(
             user_id=current_user.id, 
             connection_id=connection.id,
@@ -272,28 +347,17 @@ async def execute_query(request: QueryRequest, db: Session = Depends(get_db), cu
         db.commit()
         
         return {
-            "status" : "success",
-            "user_input" : request.user_query,
-            "sql_executed" : generated_sql,
-            "result" : data
+            "status": "success",
+            "user_input": request.user_query,
+            "sql_executed": generated_sql,
+            "explanation": explanation,
+            "results": data
         }
+
     except HTTPException:
         raise
-    except SQLAlchemyError as e:
-        error_history = models.QueryHistory(
-            user_id=current_user.id, connection_id=request.connection_id,
-            user_prompt=request.user_query, generated_sql=generated_sql, status="ERROR"
-        )
-        db.add(error_history)
-        db.commit()
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Target database execution failed: {str(e)}"
-        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
-
 
 
 # Query History Endpoint
