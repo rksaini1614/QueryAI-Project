@@ -83,7 +83,7 @@ def generate_sql_from_text(user_query: str, schema_text: str) -> tuple[str, str]
     """
 
     response = client.chat.completions.create(
-        model="openai/gpt-3.5-turbo",
+        model="openai/gpt-4o-mini",
         max_tokens = 2000,
         messages=[
             {"role": "system", "content": system_prompt},
